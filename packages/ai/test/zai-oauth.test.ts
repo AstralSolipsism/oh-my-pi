@@ -20,6 +20,7 @@ interface RecordedRequest {
 	method: string;
 	body: unknown;
 	authorization: string | null;
+	headers: Headers;
 }
 
 /** OAuth token endpoint signals success with `code: 0`. */
@@ -63,16 +64,24 @@ function makeBizFetch(
 		tokenResponse?: Response;
 		businessResponse?: Response;
 		customerResponse?: Response;
+		keysUrl?: string;
 	} = {},
 ) {
 	const requests: RecordedRequest[] = [];
 	const existingKeys = options.existingKeys ?? [];
+	const keysUrl = options.keysUrl ?? KEYS_URL;
 	const fetchMock = vi.fn(async (input: string | URL, init?: RequestInit) => {
 		const url = typeof input === "string" ? input : input.toString();
 		const method = init?.method ?? "GET";
 		const rawBody = init?.body;
 		const body = typeof rawBody === "string" && rawBody.length > 0 ? JSON.parse(rawBody) : undefined;
-		requests.push({ url, method, body, authorization: new Headers(init?.headers).get("Authorization") });
+		requests.push({
+			url,
+			method,
+			body,
+			authorization: new Headers(init?.headers).get("Authorization"),
+			headers: new Headers(init?.headers),
+		});
 
 		if (url === TOKEN_URL) {
 			return (
@@ -101,15 +110,15 @@ function makeBizFetch(
 				})
 			);
 		}
-		if (url === KEYS_URL && method === "GET") {
+		if (url === keysUrl && method === "GET") {
 			return bizEnvelope(existingKeys);
 		}
-		if (url === KEYS_URL && method === "POST") {
+		if (url === keysUrl && method === "POST") {
 			// Create returns an inline secret; the flow must IGNORE it and copy.
 			return bizEnvelope({ name: "oh-my-pi", apiKey: "created-key", secretKey: "inline-ignored" });
 		}
-		if (url.startsWith(`${KEYS_URL}/copy/`)) {
-			const apiKey = decodeURIComponent(url.slice(`${KEYS_URL}/copy/`.length));
+		if (url.startsWith(`${keysUrl}/copy/`)) {
+			const apiKey = decodeURIComponent(url.slice(`${keysUrl}/copy/`.length));
 			return bizEnvelope({ apiKey, secretKey: "real-secret" });
 		}
 		throw new Error(`unexpected fetch: ${method} ${url}`);
@@ -409,6 +418,8 @@ describe("zai oauth flow", () => {
 		expect(creds.expires).toBe(8.64e15);
 		expect(creds.email).toBe("user@example.com");
 		expect(creds.accountId).toBe("user-42");
+		expect(creds.orgId).toBeUndefined();
+		expect(creds.projectId).toBeUndefined();
 
 		// Ordered walk: token → business-login → customer → list → create → copy.
 		expect(requests.map(r => `${r.method} ${r.url}`)).toEqual([
@@ -432,9 +443,72 @@ describe("zai oauth flow", () => {
 		// Every biz call is authorized with the biz token (not the OAuth token).
 		for (const bizReq of requests.slice(2)) {
 			expect(bizReq.authorization).toBe("Bearer biz-token");
+			expect(bizReq.headers.has("bigmodel-organization")).toBe(false);
 		}
 		// Created OMP's own key name, never ZCode's.
 		expect(requests[4]?.body).toEqual({ name: "oh-my-pi" });
+	});
+
+	it("finds a team project outside the default personal organization and creates a scoped coding key", async () => {
+		const keysUrl = `${BIZ_BASE}/api/biz/v1/organization/org-team/projects/proj-team/api_keys`;
+		const { fetchMock, requests } = makeBizFetch({
+			keysUrl,
+			customerResponse: bizEnvelope({
+				organizations: [
+					{
+						organizationId: "org-personal",
+						isDefault: true,
+						projects: [{ projectId: "proj-personal", isDefault: true }],
+					},
+					{
+						organizationId: "org-team",
+						organizationName: "Our team",
+						projects: [
+							{ projectId: "proj-default", isDefault: true },
+							{ projectId: "proj-team", projectType: "2" },
+						],
+					},
+				],
+			}),
+			existingKeys: [{ name: "oh-my-pi", apiKey: "wrong-key-type", keyType: 1 }],
+		});
+		const creds = await loginZai(fetchMock as unknown as FetchImpl);
+		expect(creds).toMatchObject({
+			access: "created-key.real-secret",
+			orgId: "org-team",
+			orgName: "Our team",
+			projectId: "proj-team",
+		});
+		const keyRequests = requests.filter(request => request.url.startsWith(keysUrl));
+		expect(keyRequests.map(request => request.method)).toEqual(["GET", "POST", "GET"]);
+		for (const request of keyRequests) {
+			expect(request.headers.get("bigmodel-organization")).toBe("org-team");
+			expect(request.headers.get("bigmodel-project")).toBe("proj-team");
+		}
+		expect(keyRequests[1]!.body).toEqual({ name: "oh-my-pi", keyType: 2, usageScene: 1 });
+	});
+
+	it("reuses a team key in the default team project and retains its scope", async () => {
+		const { fetchMock, requests } = makeBizFetch({
+			customerResponse: bizEnvelope({
+				organizations: [
+					{
+						organizationId: "org-1",
+						isDefault: true,
+						projects: [
+							{ projectId: "proj-other", projectType: 2 },
+							{ projectId: "proj-1", projectType: 2, isDefault: true },
+						],
+					},
+				],
+			}),
+			existingKeys: [{ name: "oh-my-pi", apiKey: "team-key", keyType: 2 }],
+		});
+		const creds = await loginZai(fetchMock as unknown as FetchImpl);
+		expect(creds).toMatchObject({ access: "team-key.real-secret", orgId: "org-1", projectId: "proj-1" });
+		expect(requests.some(request => request.method === "POST" && request.url === KEYS_URL)).toBe(false);
+		expect(requests.at(-1)?.url).toBe(`${KEYS_URL}/copy/team-key`);
+		expect(requests.at(-1)?.headers.get("bigmodel-project")).toBe("proj-1");
 	});
 
 	it("reuses an existing key and takes the full secret from copy, not the masked list value", async () => {

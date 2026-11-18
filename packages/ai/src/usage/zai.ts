@@ -1,5 +1,7 @@
+import * as os from "node:os";
+import * as path from "node:path";
 import { toNumber } from "@oh-my-pi/pi-catalog/utils";
-import { USER_AGENT } from "@oh-my-pi/pi-utils";
+import { $pickenv, USER_AGENT } from "@oh-my-pi/pi-utils";
 import type {
 	CredentialRankingStrategy,
 	UsageFetchContext,
@@ -52,6 +54,42 @@ interface ZaiQuotaPayload {
 		/** Coding-plan tier (e.g. "lite", "pro", "max") surfaced as the plan label. */
 		level?: string;
 	};
+}
+
+interface ZaiTeamContext {
+	orgId: string;
+	projectId: string;
+}
+
+function teamContext(orgId: unknown, projectId: unknown): ZaiTeamContext | undefined {
+	if (typeof orgId !== "string" || typeof projectId !== "string" || !orgId.trim() || !projectId.trim()) return;
+	return { orgId: orgId.trim(), projectId: projectId.trim() };
+}
+
+async function defaultTeamContext(baseUrl: string): Promise<ZaiTeamContext | undefined> {
+	const configured =
+		teamContext($pickenv("ZAI_TEAM_ORGANIZATION_ID"), $pickenv("ZAI_TEAM_PROJECT_ID")) ??
+		teamContext($pickenv("BIGMODEL_ORGANIZATION"), $pickenv("BIGMODEL_PROJECT"));
+	if (configured) return configured;
+	try {
+		const settings: unknown = await Bun.file(path.join(os.homedir(), ".zcode", "v2", "setting.json")).json();
+		if (!isRecord(settings) || !isRecord(settings.providerFamilyConnectionSelections)) return;
+		const family = new URL(baseUrl).hostname === "open.bigmodel.cn" ? "bigmodel" : "zai";
+		const selection = settings.providerFamilyConnectionSelections[family];
+		if (isRecord(selection) && selection.kind === "team-coding-plan") {
+			return teamContext(selection.organizationId, selection.projectId);
+		}
+	} catch {
+		// ZCode settings are optional and may be absent or unreadable.
+	}
+}
+
+function hasNoCodingPlan(payload: ZaiQuotaPayload | null): boolean {
+	return (
+		payload?.success !== true &&
+		typeof payload?.msg === "string" &&
+		/不存在\s*coding\s*plan|no\s+coding\s+plan/i.test(payload.msg)
+	);
 }
 
 function parseMillis(value: unknown): number | undefined {
@@ -215,7 +253,8 @@ async function fetchZaiUsage(params: UsageFetchParams, ctx: UsageFetchContext): 
 	if (!token) return null;
 
 	const baseUrl = normalizeZaiBaseUrl(params.baseUrl);
-	const url = `${baseUrl}${QUOTA_PATH}`;
+	let team = teamContext(credential.orgId, credential.projectId);
+	let url = `${baseUrl}${QUOTA_PATH}`;
 	const headers: Record<string, string> = {
 		Authorization: token,
 		"Content-Type": "application/json",
@@ -224,15 +263,25 @@ async function fetchZaiUsage(params: UsageFetchParams, ctx: UsageFetchContext): 
 
 	let payload: ZaiQuotaPayload | null = null;
 	try {
-		const response = await ctx.fetch(url, {
-			headers,
-			signal: params.signal,
-		});
-		if (!response.ok) {
-			ctx.logger?.warn("ZAI usage fetch failed", { status: response.status, statusText: response.statusText });
-			return null;
+		for (;;) {
+			url = `${baseUrl}${QUOTA_PATH}${team ? "?type=2" : ""}`;
+			if (team) {
+				headers["Bigmodel-Organization"] = team.orgId;
+				headers["Bigmodel-Project"] = team.projectId;
+			}
+			const response = await ctx.fetch(url, { headers, signal: params.signal });
+			if (!response.ok) {
+				ctx.logger?.warn("ZAI usage fetch failed", { status: response.status, statusText: response.statusText });
+				return null;
+			}
+			payload = (await response.json()) as ZaiQuotaPayload;
+			// Global defaults must not redirect a personal key into a sibling team's quota.
+			if (!team && hasNoCodingPlan(payload)) {
+				team = await defaultTeamContext(baseUrl);
+				if (team) continue;
+			}
+			break;
 		}
-		payload = (await response.json()) as ZaiQuotaPayload;
 	} catch (error) {
 		ctx.logger?.warn("ZAI usage fetch error", { error: String(error) });
 		return null;
@@ -242,7 +291,7 @@ async function fetchZaiUsage(params: UsageFetchParams, ctx: UsageFetchContext): 
 	if (payload.success !== true) {
 		// An account without a GLM Coding Plan (pay-as-you-go models only) answers
 		// `{code: 500, msg: "当前用户不存在coding plan"}`: nothing to meter, not a failure.
-		if (typeof payload.msg === "string" && /不存在\s*coding\s*plan|no\s+coding\s+plan/i.test(payload.msg)) {
+		if (hasNoCodingPlan(payload)) {
 			ctx.logger?.debug("ZAI account has no Coding Plan to meter", { code: payload.code });
 			return null;
 		}
@@ -341,12 +390,13 @@ async function fetchZaiUsage(params: UsageFetchParams, ctx: UsageFetchContext): 
 			endpoint: url,
 			accountId: credential.accountId,
 			email: credential.email,
+			...(team ? { ...team, orgName: credential.orgName } : {}),
 			...(typeof payload.data?.level === "string" && payload.data.level ? { planType: payload.data.level } : {}),
 		},
 		raw: payload,
 	};
 
-	const modelUsageUrl = buildModelUsageUrl(baseUrl, new Date());
+	const modelUsageUrl = `${buildModelUsageUrl(baseUrl, new Date())}${team ? "&type=2" : ""}`;
 	try {
 		const response = await ctx.fetch(modelUsageUrl, {
 			headers,
@@ -371,7 +421,7 @@ async function fetchZaiUsage(params: UsageFetchParams, ctx: UsageFetchContext): 
 /** Fetches the account-wide quota windows for ZAI credentials. */
 export const zaiUsageProvider: UsageProvider = {
 	id: "zai",
-	cacheVersion: 2,
+	cacheVersion: 3,
 	fetchUsage: fetchZaiUsage,
 	supports: params =>
 		params.provider === "zai" &&

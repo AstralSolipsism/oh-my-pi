@@ -1,7 +1,7 @@
 /**
  * Z.ai / GLM OAuth flow (GLM Coding Plan · Sign in)
  *
- * Mirrors ZCode's desktop "Individual Plan" browser sign-in: an
+ * Mirrors ZCode's desktop browser sign-in for individual and team plans: an
  * authorization-code flow (no PKCE) against chat.z.ai, a JSON token exchange
  * that yields a short-lived OAuth access token, and a business-API sequence
  * that provisions a durable `id.secret` API key. The minted key is placed in
@@ -12,6 +12,7 @@
 import * as AIError from "../../error";
 import type { FetchImpl } from "../../types";
 import type { AfterExchangeHook } from "../hooks/types";
+import type { OAuthCredentials } from "./types";
 
 const env = (key: string): string | undefined => {
 	const value = process.env[key];
@@ -127,32 +128,41 @@ async function businessLogin(oauthAccessToken: string, fetchImpl: FetchImpl): Pr
 
 interface ZaiProject {
 	projectId?: unknown;
+	projectType?: unknown;
 	isDefault?: unknown;
 }
 interface ZaiOrganization {
 	organizationId?: unknown;
+	organizationName?: unknown;
 	isDefault?: unknown;
 	projects?: ZaiProject[];
 }
 
 /**
  * Provision the durable Z.ai API key from a short-lived OAuth access token,
- * mirroring ZCode: business-login → resolve default org/project from
+ * mirroring ZCode: business-login → resolve coding-plan org/project from
  * `getCustomerInfo` → find/create the OMP-named key → obtain its secret →
- * return `${apiKey}.${secretKey}` (the 49-char durable key).
+ * return the durable key with its team scope, when applicable.
  */
-async function mintZaiApiKey(oauthAccessToken: string, fetchImpl: FetchImpl): Promise<string> {
+async function mintZaiApiKey(
+	oauthAccessToken: string,
+	fetchImpl: FetchImpl,
+): Promise<Pick<OAuthCredentials, "access" | "orgId" | "orgName" | "projectId">> {
 	const bizToken = await businessLogin(oauthAccessToken, fetchImpl);
-	const auth = { Authorization: `Bearer ${bizToken}` };
+	const auth: Record<string, string> = { Authorization: `Bearer ${bizToken}` };
 
 	const customer = unwrapEnvelope(
 		await getJson(`${BIZ_BASE}/api/biz/customer/getCustomerInfo`, auth, fetchImpl),
 		"customer lookup",
 	) as { organizations?: ZaiOrganization[] } | undefined;
 	const orgs = Array.isArray(customer?.organizations) ? customer.organizations : [];
-	const org = orgs.find(o => o?.isDefault) ?? orgs[0];
+	const defaultOrg = orgs.find(o => o?.isDefault) ?? orgs[0];
+	const isTeam = (project: ZaiProject): boolean => project?.projectType === 2 || project?.projectType === "2";
+	const org = [defaultOrg, ...orgs].find(o => Array.isArray(o?.projects) && o.projects.some(isTeam)) ?? defaultOrg;
 	const projects = Array.isArray(org?.projects) ? org.projects : [];
-	const project = projects.find(p => p?.isDefault) ?? projects[0];
+	const teamProjects = projects.filter(isTeam);
+	const candidates = teamProjects.length > 0 ? teamProjects : projects;
+	const project = candidates.find(p => p?.isDefault) ?? candidates[0];
 	const organizationId = trimmedString(org?.organizationId);
 	const projectId = trimmedString(project?.projectId);
 	if (!organizationId || !projectId) {
@@ -161,16 +171,22 @@ async function mintZaiApiKey(oauthAccessToken: string, fetchImpl: FetchImpl): Pr
 			provider: "zai",
 		});
 	}
+	const team = project !== undefined && isTeam(project);
+	if (team) {
+		auth["bigmodel-organization"] = organizationId;
+		auth["bigmodel-project"] = projectId;
+	}
 
-	const keysUrl = `${BIZ_BASE}/api/biz/v1/organization/${organizationId}/projects/${projectId}/api_keys`;
+	const keysUrl = `${BIZ_BASE}/api/biz/v1/organization/${encodeURIComponent(organizationId)}/projects/${encodeURIComponent(projectId)}/api_keys`;
 	const existing = asKeyArray(unwrapEnvelope(await getJson(keysUrl, auth, fetchImpl), "api key list")).find(
-		key => key.name === KEY_NAME,
+		key => key.name === KEY_NAME && (!team || key.keyType === 2),
 	);
 	const keyRecord =
 		existing ??
-		(unwrapEnvelope(await postJson(keysUrl, { name: KEY_NAME }, auth, fetchImpl), "api key create") as
-			| Record<string, unknown>
-			| undefined);
+		(unwrapEnvelope(
+			await postJson(keysUrl, { name: KEY_NAME, ...(team ? { keyType: 2, usageScene: 1 } : {}) }, auth, fetchImpl),
+			"api key create",
+		) as Record<string, unknown> | undefined);
 
 	const apiKey = trimmedString(keyRecord?.apiKey);
 	if (!apiKey) {
@@ -195,11 +211,14 @@ async function mintZaiApiKey(oauthAccessToken: string, fetchImpl: FetchImpl): Pr
 		});
 	}
 
-	return `${apiKey}.${secretKey}`;
+	return {
+		access: `${apiKey}.${secretKey}`,
+		...(team ? { orgId: organizationId, orgName: trimmedString(org?.organizationName), projectId } : {}),
+	};
 }
 
 /** Replaces the short-lived OAuth token with the durable key minted by the Z.ai business APIs. */
 export const zaiMintKeyHook: AfterExchangeHook = async (credentials, context) => ({
 	...credentials,
-	access: await mintZaiApiKey(credentials.access, context.fetch),
+	...(await mintZaiApiKey(credentials.access, context.fetch)),
 });

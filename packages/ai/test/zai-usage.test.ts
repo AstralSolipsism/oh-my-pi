@@ -1,7 +1,12 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
+import * as os from "node:os";
 import type { FetchImpl } from "@oh-my-pi/pi-ai/types";
 import type { UsageFetchContext, UsageFetchParams } from "@oh-my-pi/pi-ai/usage";
 import { zaiRankingStrategy, zaiUsageProvider } from "@oh-my-pi/pi-ai/usage/zai";
+import * as utils from "@oh-my-pi/pi-utils";
+import { TempDir } from "@oh-my-pi/pi-utils";
+
+afterEach(() => vi.restoreAllMocks());
 
 function makeCredential(): UsageFetchParams["credential"] {
 	return {
@@ -239,6 +244,9 @@ describe("zai usage provider", () => {
 	});
 
 	it("treats an account without a GLM Coding Plan as nothing to meter, not an invalid response", async () => {
+		using home = TempDir.createSync("zai-no-plan-");
+		vi.spyOn(os, "homedir").mockReturnValue(home.path());
+		vi.spyOn(utils, "$pickenv").mockReturnValue(undefined);
 		const warnings: string[] = [];
 		const logger = { debug() {}, warn: (message: string) => warnings.push(message) };
 		const fetchUsage = (payload: unknown) =>
@@ -253,5 +261,159 @@ describe("zai usage provider", () => {
 		expect(await fetchUsage({ code: 500, msg: "您的coding plan已过期", success: false })).toBeNull();
 		expect(await fetchUsage({ code: 500, msg: "internal error", success: false })).toBeNull();
 		expect(warnings).toEqual(["ZAI usage response invalid", "ZAI usage response invalid"]);
+	});
+});
+
+describe("Z.AI Team Coding Plan usage", () => {
+	const noPlan = { code: 500, msg: "当前用户不存在coding plan", success: false };
+	const quota = {
+		success: true,
+		data: {
+			limits: [
+				{ type: "CREDIT_LIMIT", usage: 12000, currentValue: 3000, unit: 3, number: 5 },
+				{ type: "TOKENS_LIMIT", percentage: 60, unit: 6 },
+			],
+		},
+	};
+
+	function recordingContext(personal: unknown = noPlan) {
+		const requests: Array<{ url: URL; headers: Headers }> = [];
+		const fetch: FetchImpl = async (input, init) => {
+			const url = new URL(String(input));
+			requests.push({ url, headers: new Headers(init?.headers) });
+			return Response.json(url.pathname.endsWith("quota/limit") && !url.searchParams.has("type") ? personal : quota);
+		};
+		return { fetch, requests };
+	}
+
+	it("uses credential-scoped team headers for quota and model usage and preserves both windows", async () => {
+		const ctx = recordingContext();
+		const report = await zaiUsageProvider.fetchUsage(
+			{
+				provider: "zai",
+				credential: {
+					...makeOAuthCredential(),
+					orgId: "org-explicit",
+					orgName: "Team",
+					projectId: "project-explicit",
+				},
+			},
+			ctx,
+		);
+		expect(ctx.requests.map(r => r.url.pathname)).toEqual([
+			"/api/monitor/usage/quota/limit",
+			"/api/monitor/usage/model-usage",
+		]);
+		for (const request of ctx.requests) {
+			expect(request.url.searchParams.get("type")).toBe("2");
+			expect(request.headers.get("Bigmodel-Organization")).toBe("org-explicit");
+			expect(request.headers.get("Bigmodel-Project")).toBe("project-explicit");
+			expect(request.headers.get("Authorization")).toBe("minted-id.minted-secret");
+		}
+		expect(ctx.requests[1]!.url.searchParams.has("startTime")).toBe(true);
+		expect(ctx.requests[1]!.url.searchParams.has("endTime")).toBe(true);
+		expect(report?.limits.map(limit => [limit.id, limit.amount.usedFraction])).toEqual([
+			["zai:credits:5h", 0.25],
+			["zai:tokens:1w", 0.6],
+		]);
+		expect(report?.metadata).toMatchObject({ orgId: "org-explicit", orgName: "Team", projectId: "project-explicit" });
+	});
+
+	it("retries a key without a personal plan using environment context without redirecting personal keys", async () => {
+		const env: Record<string, string> = { ZAI_TEAM_ORGANIZATION_ID: "org-env", ZAI_TEAM_PROJECT_ID: "project-env" };
+		vi.spyOn(utils, "$pickenv").mockImplementation(key => env[key]);
+		const ctx = recordingContext();
+		const params = { provider: "zai", credential: makeCredential() };
+		const report = await zaiUsageProvider.fetchUsage(params, ctx);
+		expect(ctx.requests.map(r => r.url.searchParams.get("type"))).toEqual([null, "2", "2"]);
+		expect(ctx.requests[0]!.headers.has("Bigmodel-Organization")).toBe(false);
+		expect(ctx.requests[1]!.headers.get("Bigmodel-Organization")).toBe("org-env");
+		expect(ctx.requests[1]!.headers.get("Bigmodel-Project")).toBe("project-env");
+		expect(report?.metadata).toMatchObject({ orgId: "org-env", projectId: "project-env" });
+		const personal = recordingContext(quota);
+		const personalReport = await zaiUsageProvider.fetchUsage(params, personal);
+		expect(personal.requests.map(r => r.url.searchParams.get("type"))).toEqual([null, null]);
+		expect(personalReport?.metadata?.orgId).toBeUndefined();
+	});
+
+	it("accepts Bigmodel environment aliases and stops after a failed team retry", async () => {
+		const env: Record<string, string> = { BIGMODEL_ORGANIZATION: "org-cn", BIGMODEL_PROJECT: "project-cn" };
+		vi.spyOn(utils, "$pickenv").mockImplementation(key => env[key]);
+		const requests: Array<{ url: string; headers: Headers }> = [];
+		const fetch: FetchImpl = async (input, init) => {
+			requests.push({ url: String(input), headers: new Headers(init?.headers) });
+			return Response.json(noPlan);
+		};
+		expect(
+			await zaiUsageProvider.fetchUsage({ provider: "zai", credential: makeCredential() }, { fetch }),
+		).toBeNull();
+		expect(requests.map(r => r.url)).toEqual([
+			"https://api.z.ai/api/monitor/usage/quota/limit",
+			"https://api.z.ai/api/monitor/usage/quota/limit?type=2",
+		]);
+		expect(requests[1]!.headers.get("Bigmodel-Project")).toBe("project-cn");
+	});
+
+	it.each([
+		["https://api.z.ai", "zai"],
+		["https://open.bigmodel.cn/api/paas/v4", "bigmodel"],
+	])("uses the matching ZCode family for %s", async (baseUrl, family) => {
+		using home = TempDir.createSync("zai-team-settings-");
+		vi.spyOn(os, "homedir").mockReturnValue(home.path());
+		vi.spyOn(utils, "$pickenv").mockReturnValue(undefined);
+		await Bun.write(
+			home.join(".zcode/v2/setting.json"),
+			JSON.stringify({
+				providerFamilyConnectionSelections: {
+					zai: { kind: "team-coding-plan", organizationId: "org-zai", projectId: "project-zai" },
+					bigmodel: { kind: "team-coding-plan", organizationId: "org-bigmodel", projectId: "project-bigmodel" },
+				},
+			}),
+		);
+		const ctx = recordingContext();
+		const report = await zaiUsageProvider.fetchUsage({ provider: "zai", credential: makeCredential(), baseUrl }, ctx);
+		expect(ctx.requests.map(r => r.url.searchParams.get("type"))).toEqual([null, "2", "2"]);
+		expect(ctx.requests[1]!.headers.get("Bigmodel-Organization")).toBe(`org-${family}`);
+		expect(report?.metadata?.projectId).toBe(`project-${family}`);
+	});
+
+	it.each([
+		undefined,
+		"invalid JSON",
+		"null",
+		JSON.stringify({
+			providerFamilyConnectionSelections: {
+				zai: {
+					kind: "team-coding-plan",
+					organizationId: "org-incomplete",
+				},
+			},
+		}),
+		JSON.stringify({
+			providerFamilyConnectionSelections: {
+				zai: {
+					kind: "individual-coding-plan",
+					organizationId: "org-personal",
+					projectId: "project-personal",
+				},
+			},
+		}),
+	])("ignores missing or unusable ZCode settings (%s) for a key without a plan", async settings => {
+		using home = TempDir.createSync("zai-invalid-settings-");
+		vi.spyOn(os, "homedir").mockReturnValue(home.path());
+		vi.spyOn(utils, "$pickenv").mockReturnValue(undefined);
+		if (settings !== undefined) await Bun.write(home.join(".zcode/v2/setting.json"), settings);
+		const ctx = recordingContext();
+		const warn = vi.fn();
+		const report = await zaiUsageProvider.fetchUsage(
+			{ provider: "zai", credential: makeCredential() },
+			{
+				...ctx,
+				logger: { warn, debug() {} },
+			},
+		);
+		expect(report).toBeNull();
+		expect(ctx.requests.map(r => r.url.searchParams.get("type"))).toEqual([null]);
+		expect(warn).not.toHaveBeenCalled();
 	});
 });

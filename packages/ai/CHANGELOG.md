@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Support Z.AI Team Coding Plan usage and preserve the organization and project when signing in to a team plan.
+
 ## [18.22.2] - 2026-11-18
 
 ### Added
