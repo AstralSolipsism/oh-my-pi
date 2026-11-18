@@ -29,6 +29,7 @@ import { resetAccountLockKey } from "@oh-my-pi/pi-coding-agent/session/codex-aut
 import { claimResetExpiryNotice } from "@oh-my-pi/pi-coding-agent/session/reset-expiry";
 import { resetLockPath } from "@oh-my-pi/pi-coding-agent/session/reset-fence";
 import {
+	collectStoredAccounts,
 	collectUnreportedAccounts,
 	type UsageAccountIdentity,
 } from "@oh-my-pi/pi-coding-agent/slash-commands/helpers/usage-accounts";
@@ -408,6 +409,57 @@ describe("computeProviderWindowStats", () => {
 });
 
 describe("collectUnreportedAccounts", () => {
+	it("does not reuse duplicate tagged reports to cover a sibling API key", async () => {
+		const storage = createInMemoryAuthStorage();
+		try {
+			await storage.credentials.set("zai", [
+				{ type: "api_key", key: "missing-key" },
+				{ type: "api_key", key: "reported-key" },
+			]);
+			const accounts = collectStoredAccounts(storage);
+			const reportedId = storage.credentials.list("zai")[1]!.id;
+			const report: UsageReport = {
+				provider: "zai",
+				fetchedAt: Date.now(),
+				limits: [],
+				metadata: { credentialId: reportedId },
+			};
+			expect(accounts[1]?.credentialId).toBe(reportedId);
+			expect(collectUnreportedAccounts([report, report], accounts)).toEqual([accounts[0]!]);
+			expect(collectUnreportedAccounts([], accounts)).toEqual(accounts);
+		} finally {
+			storage.close();
+		}
+	});
+
+	it("uses each untagged report to cover at most one API key of the same provider", () => {
+		const keys: UsageAccountIdentity[] = [
+			{ provider: "zai", type: "api_key", credentialId: 1 },
+			{ provider: "zai", type: "api_key", credentialId: 2 },
+			{ provider: "zai", type: "api_key", credentialId: 3 },
+			{ provider: "other", type: "api_key", credentialId: 4 },
+		];
+		const report: UsageReport = { provider: "zai", fetchedAt: Date.now(), limits: [] };
+		expect(collectUnreportedAccounts([report], keys)).toEqual(keys.slice(1));
+		expect(collectUnreportedAccounts([report, report, report], keys)).toEqual([keys[3]!]);
+		expect(collectUnreportedAccounts([{ ...report, metadata: { credentialId: 2 } }, report], keys)).toEqual([
+			keys[2]!,
+			keys[3]!,
+		]);
+	});
+
+	it("does not let a tagged OAuth report cover an API key", () => {
+		const key: UsageAccountIdentity = { provider: "zai", type: "api_key", credentialId: 1 };
+		const oauth: UsageAccountIdentity = {
+			provider: "zai",
+			type: "oauth",
+			credentialId: 2,
+			email: "user@example.test",
+		};
+		const report = { ...makeReport("zai", oauth.email!, []), metadata: { email: oauth.email, credentialId: 2 } };
+		expect(collectUnreportedAccounts([report], [key, oauth])).toEqual([key]);
+	});
+
 	const accounts: UsageAccountIdentity[] = [
 		{ provider: "anthropic", type: "oauth", email: "seen@example.test" },
 		{ provider: "anthropic", type: "oauth", email: "missing@example.test" },
@@ -1825,6 +1877,40 @@ describe("omp usage --json account policy", () => {
 		// The command's ModelRegistry opened `<agentDir>/models.db`; Windows cannot delete it while open.
 		closeModelCache();
 		tempDir.removeSync();
+	});
+
+	it("includes an unreported stored API key beside its exhausted sibling in JSON", async () => {
+		const usageFetch = Object.assign(
+			async (_input: string | URL | Request, init?: RequestInit) => {
+				if (new Headers(init?.headers).get("Authorization") !== "exhausted-key")
+					return new Response(null, { status: 403 });
+				return Response.json({
+					success: true,
+					data: { limits: [{ type: "TOKENS_LIMIT", percentage: 100, unit: 6 }] },
+				});
+			},
+			{ preconnect: fetch.preconnect },
+		);
+		const storage = new AuthStorage(new SqliteAuthCredentialStore(new Database(":memory:")), { usageFetch });
+		await storage.credentials.set("zai", [
+			{ type: "api_key", key: "unreported-key" },
+			{ type: "api_key", key: "exhausted-key" },
+		]);
+		const [missing, exhausted] = storage.credentials.list("zai");
+		vi.spyOn(Settings, "loadReadOnly").mockResolvedValue(Settings.isolated());
+		vi.spyOn(sdkModule, "discoverAuthStorage").mockResolvedValue(storage);
+		let stdout = "";
+		vi.spyOn(process.stdout, "write").mockImplementation(chunk => {
+			stdout += String(chunk);
+			return true;
+		});
+		await runUsageCommand({ provider: "zai", json: true, redact: true, noExtensions: true });
+		const output = JSON.parse(stdout);
+		expect(output.reports.map((report: UsageReport) => report.metadata?.credentialId)).toEqual([exhausted!.id]);
+		expect(output.reports[0].limits[0].status).toBe("exhausted");
+		expect(output.accountsWithoutUsage).toEqual([{ provider: "zai", type: "api_key", credentialId: missing!.id }]);
+		expect(stdout).not.toContain("unreported-key");
+		expect(stdout).not.toContain("exhausted-key");
 	});
 
 	it.each([false, true])("matches each account's policy before --redact masks it (redact: %p)", async redact => {

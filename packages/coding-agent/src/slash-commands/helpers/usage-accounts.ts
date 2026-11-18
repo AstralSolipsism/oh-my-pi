@@ -4,6 +4,7 @@ import type { AuthStorage, UsageReport } from "@oh-my-pi/pi-ai";
 export interface UsageAccountIdentity {
 	provider: string;
 	type: "api_key" | "oauth";
+	credentialId?: number;
 	email?: string;
 	accountId?: string;
 	projectId?: string;
@@ -18,26 +19,22 @@ export interface UsageAccountIdentity {
 /** Flatten every stored credential (OAuth and API key) into identity rows for unreported-account detection. */
 export function collectStoredAccounts(authStorage: AuthStorage): UsageAccountIdentity[] {
 	const accounts: UsageAccountIdentity[] = [];
-	const all = authStorage.credentials.all();
-	for (const provider in all) {
-		const entry = all[provider];
-		const credentials = Array.isArray(entry) ? entry : [entry];
-		for (const credential of credentials) {
-			if (credential.type === "oauth") {
-				accounts.push({
-					provider,
-					type: "oauth",
-					email: credential.email,
-					accountId: credential.accountId,
-					projectId: credential.projectId,
-					enterpriseUrl: credential.enterpriseUrl,
-					orgId: credential.orgId,
-					orgName: credential.orgName,
-					authorizedAt: credential.authorizedAt,
-				});
-			} else {
-				accounts.push({ provider, type: "api_key" });
-			}
+	for (const { id, provider, credential } of authStorage.credentials.list()) {
+		if (credential.type === "oauth") {
+			accounts.push({
+				provider,
+				type: "oauth",
+				credentialId: id,
+				email: credential.email,
+				accountId: credential.accountId,
+				projectId: credential.projectId,
+				enterpriseUrl: credential.enterpriseUrl,
+				orgId: credential.orgId,
+				orgName: credential.orgName,
+				authorizedAt: credential.authorizedAt,
+			});
+		} else {
+			accounts.push({ provider, type: "api_key", credentialId: id });
 		}
 	}
 	return accounts;
@@ -87,27 +84,37 @@ function reportIdentifiers(report: UsageReport): Set<string> {
 /**
  * Stored credentials that no usage report could be attributed to.
  *
- * Conservative on purpose: when a provider's reports or the credential carry
- * no identity at all (or the credential is an API key alongside existing
- * reports), we can't attribute, so we don't claim the account is missing.
- * The tradeoff: once a provider returns any report, its identity-less rows
- * are never flagged, so a failed fetch for one of several identity-less
- * logins of the same provider (e.g. two Devin browser logins) goes unshown.
+ * API keys match by stored credential id. Reports without that tag cover at
+ * most one key each. OAuth accounts retain their provider identity matching.
  */
 export function collectUnreportedAccounts(
 	reports: UsageReport[],
 	accounts: UsageAccountIdentity[],
 ): UsageAccountIdentity[] {
 	const byProvider = new Map<string, UsageReport[]>();
+	const untaggedReports = new Map<string, number>();
 	for (const report of reports) {
 		const list = byProvider.get(report.provider) ?? [];
 		list.push(report);
 		byProvider.set(report.provider, list);
+		if (typeof report.metadata?.credentialId !== "number") {
+			untaggedReports.set(report.provider, (untaggedReports.get(report.provider) ?? 0) + 1);
+		}
 	}
 	return accounts.filter(account => {
 		const providerReports = byProvider.get(account.provider) ?? [];
 		if (providerReports.length === 0) return true;
-		if (account.type === "api_key") return false;
+		if (account.type === "api_key") {
+			if (
+				account.credentialId !== undefined &&
+				providerReports.some(report => report.metadata?.credentialId === account.credentialId)
+			)
+				return false;
+			const remaining = untaggedReports.get(account.provider) ?? 0;
+			if (remaining === 0) return true;
+			untaggedReports.set(account.provider, remaining - 1);
+			return false;
+		}
 		// Org-decisive attribution when EITHER side carries an org (Anthropic
 		// multi-subscription): two orgs share every other identifier, so an
 		// org-scoped account is covered only by its own org's report, and an
