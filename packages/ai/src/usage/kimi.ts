@@ -1,16 +1,17 @@
 import { toNumber } from "@oh-my-pi/pi-catalog/utils";
 import { $env } from "@oh-my-pi/pi-utils";
 import { getKimiCommonHeaders } from "../registry/oauth/kimi";
-import type {
-	CredentialRankingStrategy,
-	UsageAmount,
-	UsageFetchContext,
-	UsageFetchParams,
-	UsageLimit,
-	UsageProvider,
-	UsageReport,
-	UsageWindow,
-	UsageUnit,
+import {
+	type CredentialRankingStrategy,
+	type UsageAmount,
+	type UsageFetchContext,
+	type UsageFetchParams,
+	type UsageLimit,
+	type UsageProvider,
+	type UsageReport,
+	type UsageWindow,
+	type UsageUnit,
+	resolveUsedFraction,
 } from "../usage";
 import { isRecord } from "../utils";
 import { parseIsoTimestamp, usageStatus } from "./shared";
@@ -342,13 +343,49 @@ export const kimiUsageProvider: UsageProvider = {
 	},
 };
 
+/** Subscription windows that gate every Kimi Code request, whatever the model. */
+const GATING_WINDOW_IDS = new Set(["5h", "7d", "limit_month_total", "limit_month_code"]);
+
+function gatingWindowLimits(report: UsageReport): UsageLimit[] {
+	return report.limits.filter(limit => {
+		const windowId = limit.window?.id;
+		return windowId !== undefined && GATING_WINDOW_IDS.has(windowId);
+	});
+}
+
 /** Ranks Kimi OAuth accounts by the canonical 5-hour and 7-day quota windows. */
 export const kimiRankingStrategy: CredentialRankingStrategy = {
+	// Kimi quota blocks predate scoping and sit on the bare provider key.
+	healsGlobalBlocks: true,
 	findWindowLimits: report => ({
 		primary: report.limits.find(limit => limit.window?.id === "5h"),
 		secondary: report.limits.find(limit => limit.window?.id === "7d"),
 	}),
-	scopeLimits: report => report.limits.filter(limit => limit.window?.id === "5h" || limit.window?.id === "7d"),
+	scopeLimits: gatingWindowLimits,
+	// All models share one Coding Plan pool, so healing judges the unscoped
+	// block by the subscription windows and ignores the one-shot totalQuota
+	// top-up. A report vouches for recovery only when every gating window is
+	// quantitative: unknown or partial reports never heal. Complete coverage
+	// means the burst window plus a long window, or a weekly window at 0% used
+	// (no burst can be spent when the week spent nothing); anything less needs
+	// a reset matching the stored deadline, so a lone healthy 5h row cannot
+	// clear a weekly cooldown it knows nothing about.
+	healableBlockScopes(report) {
+		const gatingLimits = gatingWindowLimits(report);
+		if (gatingLimits.length === 0) return [];
+		if (gatingLimits.some(limit => limit.status === "unknown" || resolveUsedFraction(limit) === undefined)) {
+			return [];
+		}
+		const has5h = gatingLimits.some(limit => limit.window?.id === "5h");
+		const hasLongWindow = gatingLimits.some(limit => limit.window?.id !== "5h");
+		const weekly = gatingLimits.find(limit => limit.window?.id === "7d");
+		const complete = (has5h && hasLongWindow) || (weekly !== undefined && resolveUsedFraction(weekly) === 0);
+		return [
+			complete
+				? { blockScope: "", limits: gatingLimits }
+				: { blockScope: "", limits: gatingLimits, resetMatchRequired: true },
+		];
+	},
 	windowDefaults: {
 		primaryMs: 5 * HOUR_MS,
 		secondaryMs: 7 * DAY_MS,
