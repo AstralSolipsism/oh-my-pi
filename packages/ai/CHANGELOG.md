@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed a Kimi Code OAuth account staying benched until a quota window's stated reset even after the provider restored the quota early; a fresh live usage report now lifts the stale cooldown
+
 ## [18.22.2] - 2026-11-18
 
 ### Added
