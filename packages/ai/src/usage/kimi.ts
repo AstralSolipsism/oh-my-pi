@@ -1,16 +1,17 @@
 import { toNumber } from "@oh-my-pi/pi-catalog/utils";
 import { $env } from "@oh-my-pi/pi-utils";
 import { getKimiCommonHeaders } from "../registry/oauth/kimi";
-import type {
-	CredentialRankingStrategy,
-	UsageAmount,
-	UsageFetchContext,
-	UsageFetchParams,
-	UsageLimit,
-	UsageProvider,
-	UsageReport,
-	UsageWindow,
-	UsageUnit,
+import {
+	type CredentialRankingStrategy,
+	type UsageAmount,
+	type UsageFetchContext,
+	type UsageFetchParams,
+	type UsageLimit,
+	type UsageProvider,
+	type UsageReport,
+	type UsageWindow,
+	type UsageUnit,
+	resolveUsedFraction,
 } from "../usage";
 import { isRecord } from "../utils";
 import { parseIsoTimestamp, usageStatus } from "./shared";
@@ -342,13 +343,59 @@ export const kimiUsageProvider: UsageProvider = {
 	},
 };
 
+/** Monthly aggregate meters; they share one billing-period reset. */
+const MONTHLY_WINDOW_IDS = new Set(["limit_month_total", "limit_month_code"]);
+/** Subscription windows a live report can vouch for, whatever the model. */
+const HEALING_WINDOW_IDS = new Set(["5h", "7d", ...MONTHLY_WINDOW_IDS]);
+
+function healingWindowLimits(report: UsageReport): UsageLimit[] {
+	return report.limits.filter(limit => {
+		const windowId = limit.window?.id;
+		return windowId !== undefined && HEALING_WINDOW_IDS.has(windowId);
+	});
+}
+
 /** Ranks Kimi OAuth accounts by the canonical 5-hour and 7-day quota windows. */
 export const kimiRankingStrategy: CredentialRankingStrategy = {
+	// Kimi quota blocks predate scoping and sit on the bare provider key.
+	healsGlobalBlocks: true,
 	findWindowLimits: report => ({
 		primary: report.limits.find(limit => limit.window?.id === "5h"),
 		secondary: report.limits.find(limit => limit.window?.id === "7d"),
 	}),
 	scopeLimits: report => report.limits.filter(limit => limit.window?.id === "5h" || limit.window?.id === "7d"),
+	// All meters above write the same unscoped block, and a monthly 403 leaves
+	// that block while /usages can still answer a healthy week, so a report
+	// vouches for recovery only when every window is quantitative AND complete:
+	// the weekly window plus both monthly meters, with the burst window either
+	// reported or provably unspent (a 0% week cannot hide a spent burst).
+	// Anything less must match the stored deadline to lift the block, and a
+	// lone monthly meter cannot match on its own — it shares the monthly
+	// billing reset with whichever sibling meter the report omitted.
+	healableBlockScopes(report) {
+		const gatingLimits = healingWindowLimits(report);
+		if (gatingLimits.length === 0) return [];
+		if (gatingLimits.some(limit => limit.status === "unknown" || resolveUsedFraction(limit) === undefined)) {
+			return [];
+		}
+		const hasWindow = (windowId: string) => gatingLimits.some(limit => limit.window?.id === windowId);
+		const weekly = gatingLimits.find(limit => limit.window?.id === "7d");
+		const complete =
+			weekly !== undefined &&
+			hasWindow("limit_month_total") &&
+			hasWindow("limit_month_code") &&
+			(hasWindow("5h") || resolveUsedFraction(weekly) === 0);
+		if (complete) return [{ blockScope: "", limits: gatingLimits }];
+		const matchLimits = gatingLimits.map(limit => {
+			const loneMonthly =
+				limit.window?.id === "limit_month_total"
+					? !hasWindow("limit_month_code")
+					: limit.window?.id === "limit_month_code" && !hasWindow("limit_month_total");
+			return loneMonthly ? { ...limit, scope: { ...limit.scope, shared: false } } : limit;
+		});
+		if (!matchLimits.some(limit => limit.scope.shared === true)) return [];
+		return [{ blockScope: "", limits: matchLimits, resetMatchRequired: true }];
+	},
 	windowDefaults: {
 		primaryMs: 5 * HOUR_MS,
 		secondaryMs: 7 * DAY_MS,
