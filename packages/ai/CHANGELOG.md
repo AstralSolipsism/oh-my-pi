@@ -11,6 +11,7 @@
 - Fixed `omp usage` showing no data for Synthetic’s weekly-only plans; it now shows weekly credit usage and the next regeneration tick ([#20251](https://github.com/can1357/oh-my-pi/pull/20251) by [@dagurval](https://github.com/dagurval))
 - Fixed `antigravity-cli` quota exhaustion on agy 1.5.14+ being recorded as a normal reply instead of a rate limit, so exhausted accounts now rotate to healthy ones and honor the reported reset time ([#20247](https://github.com/can1357/oh-my-pi/issues/20247))
 - Gemini models on OpenRouter keep thinking throughout long tool loops instead of going silent after the first few steps; replayed reasoning now keeps the `id` and `format` OpenRouter needs to return Gemini's thought signatures
+- Fixed Kimi Code OAuth accounts staying skipped until a quota window's stated reset even after the provider restored quota early; a fresh live usage report now lifts the stale cooldown ([#20290](https://github.com/can1357/oh-my-pi/pull/20290) by [@AstralSolipsism](https://github.com/AstralSolipsism))
 
 ## [19.1.1] - 2026-11-23
 
